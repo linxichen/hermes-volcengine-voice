@@ -106,9 +106,9 @@ def _volcengine_tts(
             import base64
             audio_chunks.append(base64.b64decode(data_b64))
 
-        # Check for error
+        # Check for error (20000000 = end-of-stream OK marker, not an error)
         code = chunk.get("code", 0)
-        if code != 0:
+        if code != 0 and code != 20000000:
             msg = chunk.get("message", "unknown error")
             raise RuntimeError(f"Volcengine TTS error {code}: {msg}")
 

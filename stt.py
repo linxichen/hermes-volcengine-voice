@@ -102,6 +102,47 @@ def volcengine_transcribe(
 # ── Internal ───────────────────────────────────────────────────────────────
 
 
+def _extract_asr_text(result: dict) -> str:
+    """Extract transcript text from Volcengine ASR v3 response.
+
+    The v3 API returns: {"result": {"text": "transcription", "utterances": [...]}}
+    Falls back to older payload_msg format for backwards compatibility.
+    """
+    # 1. Current v3 format: {"result": {"text": "..."}}
+    inner = result.get("result")
+    if isinstance(inner, dict):
+        text = inner.get("text", "")
+        if text:
+            return text.strip()
+        # Try utterances if no top-level text
+        for u in inner.get("utterances", []):
+            if isinstance(u, dict) and u.get("text"):
+                return u["text"].strip()
+    elif isinstance(inner, list):
+        parts = []
+        for item in inner:
+            t = item.get("text", "") if isinstance(item, dict) else str(item)
+            if t:
+                parts.append(t.strip())
+        return "".join(parts)
+    elif isinstance(inner, str):
+        return inner.strip()
+
+    # 2. Fallback: old payload_msg format
+    payload_msg = result.get("payload_msg", {})
+    inner = payload_msg.get("result", "")
+    if isinstance(inner, str):
+        return inner.strip()
+    if isinstance(inner, list):
+        parts = []
+        for item in inner:
+            t = item.get("text", "") if isinstance(item, dict) else str(item)
+            if t:
+                parts.append(t.strip())
+        return "".join(parts)
+    return ""
+
+
 def _get_api_key() -> str:
     key = os.getenv("VOLCENGINE_VOICE_API_KEY", "")
     if not key:
@@ -216,26 +257,39 @@ def _transcribe_volcengine(
                     logger.debug("Volcengine ASR: text response: %s", raw[:200])
                     continue
 
-                # Parse binary response
+                # ── Parse binary response ──────────────────────────────
                 if len(raw) < HEADER_SIZE + SIZE_FIELD_SIZE:
                     continue
 
                 hdr = raw[:HEADER_SIZE]
                 msg_type = (hdr[1] >> 4) & 0x0F
+                flags = (hdr[1]) & 0x0F
 
-                size = struct.unpack(">I", raw[HEADER_SIZE:HEADER_SIZE + SIZE_FIELD_SIZE])[0]
-                pl = raw[HEADER_SIZE + SIZE_FIELD_SIZE:HEADER_SIZE + SIZE_FIELD_SIZE + size]
+                # Full Server Response format per Volcengine docs:
+                #   Header | [Sequence (if flags=0b0001 or 0b0011)] | Payload size | Payload
+                # Flags 0b0000/0b0010: no sequence, offset 4 = payload size
+                # Flags 0b0001/0b0011: has sequence, offset 4 = sequence, offset 8 = payload size
+                has_sequence = (flags == FLAG_POSITIVE_SEQUENCE) or (flags == FLAG_LAST_NEGATIVE_SEQUENCE)
+                payload_offset = HEADER_SIZE + (SIZE_FIELD_SIZE if has_sequence else 0)
+
+                if len(raw) < payload_offset + SIZE_FIELD_SIZE:
+                    continue
+
+                size = struct.unpack(">I", raw[payload_offset:payload_offset + SIZE_FIELD_SIZE])[0]
+                pl = raw[payload_offset + SIZE_FIELD_SIZE:payload_offset + SIZE_FIELD_SIZE + size]
 
                 if msg_type == MSG_FULL_SERVER_RESPONSE:
                     try:
-                        # Decompress if needed
+                        import gzip
                         compression = hdr[2] & 0x0F
                         if compression == COMPRESSION_GZIP:
-                            import gzip
                             pl = gzip.decompress(pl)
 
+                        if not pl:
+                            continue
+
                         result = json.loads(pl.decode("utf-8"))
-                        text = result.get("payload_msg", {}).get("result", "")
+                        text = _extract_asr_text(result)
                         if text:
                             transcript_parts.append(text)
                     except Exception as exc:

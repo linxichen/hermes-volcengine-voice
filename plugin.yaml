@@ -6,4 +6,4 @@ author: Linxi Chen
 provides_hooks:
   - pre_llm_call
 requires_env:
-  - VOLCENGINE_API_KEY
+  - VOLCENGINE_VOICE_API_KEY

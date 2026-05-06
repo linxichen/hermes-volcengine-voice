@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 # ── Constants ──────────────────────────────────────────────────────────────
 
-ASR_ENDPOINT = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel"
+ASR_ENDPOINT = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async"
 RESOURCE_ID = "volc.seedasr.sauc.duration"  # model 2.0, duration billing
 
 # WebSocket binary protocol constants
@@ -102,30 +102,43 @@ def volcengine_transcribe(
 # ── Internal ───────────────────────────────────────────────────────────────
 
 
-def _extract_asr_text(result: dict) -> str:
-    """Extract transcript text from Volcengine ASR v3 response.
+def _extract_asr_text(result: dict[str, Any]) -> str:
+    """Extract transcript text from Volcengine ASR response.
 
-    The v3 API returns: {"result": {"text": "transcription", "utterances": [...]}}
-    Falls back to older payload_msg format for backwards compatibility.
+    The current (v3) response structure is:
+      {"result": {"text": "transcription here", "utterances": [...]}}
+
+    Also handles older payload_msg format for backwards compatibility.
+    The ``result`` field can be a dict with ``text`` key, a string, or a
+    list of dicts/strings.
     """
-    # 1. Current v3 format: {"result": {"text": "..."}}
+    # 1. Try current v3 format: {"result": {"text": "..."}}
     inner = result.get("result")
     if isinstance(inner, dict):
         text = inner.get("text", "")
         if text:
             return text.strip()
         # Try utterances if no top-level text
-        for u in inner.get("utterances", []):
-            if isinstance(u, dict) and u.get("text"):
-                return u["text"].strip()
+        utterances = inner.get("utterances", [])
+        if utterances:
+            parts = []
+            for u in utterances:
+                if isinstance(u, dict):
+                    t = u.get("text", "")
+                    if t:
+                        parts.append(t.strip())
+            return "".join(parts)
     elif isinstance(inner, list):
         parts = []
         for item in inner:
-            t = item.get("text", "") if isinstance(item, dict) else str(item)
+            if isinstance(item, dict):
+                t = item.get("text", "")
+            elif isinstance(item, str):
+                t = item
             if t:
                 parts.append(t.strip())
         return "".join(parts)
-    elif isinstance(inner, str):
+    elif isinstance(inner, str) and inner:
         return inner.strip()
 
     # 2. Fallback: old payload_msg format
@@ -136,11 +149,16 @@ def _extract_asr_text(result: dict) -> str:
     if isinstance(inner, list):
         parts = []
         for item in inner:
-            t = item.get("text", "") if isinstance(item, dict) else str(item)
+            if isinstance(item, dict):
+                t = item.get("text", "")
+            elif isinstance(item, str):
+                t = item
+            else:
+                continue
             if t:
                 parts.append(t.strip())
         return "".join(parts)
-    return ""
+    return str(inner).strip() if inner else ""
 
 
 def _get_api_key() -> str:
@@ -148,7 +166,7 @@ def _get_api_key() -> str:
     if not key:
         raise ValueError(
             "VOLCENGINE_VOICE_API_KEY not set. "
-            "Add it to ~/.hermes/.env or set the environment variable."
+            "Add it to ~/.hermes/env.d/volcengine.env or set the environment variable."
         )
     return key
 
@@ -162,7 +180,6 @@ def _transcribe_volcengine(
 ) -> str:
     """Send audio to Volcengine ASR via WebSocket and return transcript."""
     import asyncio
-    import websockets
 
     # Read audio file
     with open(audio_path, "rb") as f:
@@ -182,23 +199,23 @@ def _transcribe_volcengine(
     }
     audio_format = format_map.get(ext, "mp3")
 
-    connect_id = str(uuid.uuid4())
-
     async def _do_transcribe() -> str:
+        import websockets as _ws
+
         headers = {
             "X-Api-Key": api_key,
             "X-Api-Resource-Id": RESOURCE_ID,
             "X-Api-Request-Id": str(uuid.uuid4()),
-            "X-Api-Connect-Id": connect_id,
+            "X-Api-Sequence": "-1",
         }
 
-        async with websockets.connect(
+        async with _ws.connect(
             ASR_ENDPOINT,
             additional_headers=headers,
             max_size=64 * 1024 * 1024,  # 64MB
         ) as ws:
             # 1. Send Full Client Request
-            request = {
+            request: dict[str, Any] = {
                 "user": {"uid": "hermes-agent"},
                 "audio": {
                     "format": audio_format,
@@ -208,13 +225,13 @@ def _transcribe_volcengine(
                     "model_name": "bigmodel",
                     "enable_itn": enable_itn,
                     "enable_punc": enable_punc,
+                    "enable_nonstream": True,  # async mode needs this for full-text result
                 },
             }
             if language:
                 request["audio"]["language"] = language
 
             payload = json.dumps(request).encode("utf-8")
-            # Gzip compress
             import gzip
             payload = gzip.compress(payload)
 
@@ -250,15 +267,30 @@ def _transcribe_volcengine(
                 try:
                     raw = await asyncio.wait_for(ws.recv(), timeout=30)
                 except asyncio.TimeoutError:
+                    logger.warning("Volcengine ASR: timed out waiting for response")
+                    break
+                except _ws.exceptions.ConnectionClosedOK as exc:
+                    # Server cleanly closed — this is normal completion
+                    logger.debug("Volcengine ASR: server closed: %s", exc)
+                    break
+                except _ws.exceptions.ConnectionClosedError as exc:
+                    logger.warning("Volcengine ASR: server closed with error: %s", exc)
                     break
 
                 if isinstance(raw, str):
-                    # Text response — this is unexpected but handle it
-                    logger.debug("Volcengine ASR: text response: %s", raw[:200])
+                    # Text frame — try parsing as JSON response
+                    try:
+                        result = json.loads(raw)
+                        text = _extract_asr_text(result)
+                        if text:
+                            transcript_parts.append(text)
+                    except json.JSONDecodeError:
+                        logger.debug("Volcengine ASR: non-JSON text response: %s", raw[:200])
                     continue
 
-                # ── Parse binary response ──────────────────────────────
+                # Parse binary response
                 if len(raw) < HEADER_SIZE + SIZE_FIELD_SIZE:
+                    logger.debug("Volcengine ASR: short frame (%d bytes), skipping", len(raw))
                     continue
 
                 hdr = raw[:HEADER_SIZE]
@@ -266,13 +298,14 @@ def _transcribe_volcengine(
                 flags = (hdr[1]) & 0x0F
 
                 # Full Server Response format per Volcengine docs:
-                #   Header | [Sequence (if flags=0b0001 or 0b0011)] | Payload size | Payload
+                #   Header (4B) | [Sequence (4B, if flags=0b0001 or 0b0011)] | Payload size (4B) | Payload
                 # Flags 0b0000/0b0010: no sequence, offset 4 = payload size
                 # Flags 0b0001/0b0011: has sequence, offset 4 = sequence, offset 8 = payload size
                 has_sequence = (flags == FLAG_POSITIVE_SEQUENCE) or (flags == FLAG_LAST_NEGATIVE_SEQUENCE)
                 payload_offset = HEADER_SIZE + (SIZE_FIELD_SIZE if has_sequence else 0)
 
                 if len(raw) < payload_offset + SIZE_FIELD_SIZE:
+                    logger.debug("Volcengine ASR: short frame (%d bytes), skipping", len(raw))
                     continue
 
                 size = struct.unpack(">I", raw[payload_offset:payload_offset + SIZE_FIELD_SIZE])[0]
@@ -280,18 +313,25 @@ def _transcribe_volcengine(
 
                 if msg_type == MSG_FULL_SERVER_RESPONSE:
                     try:
-                        import gzip
+                        # Decompress if needed
                         compression = hdr[2] & 0x0F
                         if compression == COMPRESSION_GZIP:
-                            pl = gzip.decompress(pl)
+                            try:
+                                pl = gzip.decompress(pl)
+                            except Exception:
+                                logger.debug("Volcengine ASR: gzip decompress failed, trying raw")
+                                pass
 
                         if not pl:
+                            logger.debug("Volcengine ASR: empty payload in FULL_SERVER_RESPONSE")
                             continue
 
                         result = json.loads(pl.decode("utf-8"))
                         text = _extract_asr_text(result)
                         if text:
                             transcript_parts.append(text)
+                    except json.JSONDecodeError:
+                        logger.debug("Volcengine ASR: non-JSON binary payload, len=%d", len(pl))
                     except Exception as exc:
                         logger.warning("Volcengine ASR: parse error: %s", exc)
 

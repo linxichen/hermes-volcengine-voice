@@ -6,7 +6,7 @@ Hermes dispatch layer. Also registers a pre_llm_call hook that injects
 voice-friendly response instructions when volcengine is the active provider.
 
 Usage:
-  1. Set VOLCENGINE_API_KEY in ~/.hermes/env.d/volcengine.env
+  1. Set VOLCENGINE_VOICE_API_KEY in ~/.hermes/env.d/volcengine.env
   2. Set config.yaml:
        tts.provider: volcengine
        stt.provider: volcengine

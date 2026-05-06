@@ -1,23 +1,60 @@
 """
 Volcengine (Doubao) Voice Plugin for Hermes Agent.
 
-Monkey-patches the TTS dispatch to add 'volcengine' as a provider.
-STT integration is TODO (requires WebSocket binary protocol for ASR).
+Adds 'volcengine' as a TTS and STT provider by monkey-patching the
+Hermes dispatch layer. Also registers a pre_llm_call hook that injects
+voice-friendly response instructions when volcengine is the active provider.
 
 Usage:
-  1. Set VOLCENGINE_VOICE_API_KEY in ~/.hermes/.env
+  1. Set VOLCENGINE_API_KEY in ~/.hermes/env.d/volcengine.env
   2. Set config.yaml:
        tts.provider: volcengine
-       tts.volcengine.speaker: zh_female_conversation  (optional)
-  3. Restart Hermes gateway
+       stt.provider: volcengine
+  3. Enable: hermes plugins enable volcengine-voice
+  4. Restart Hermes gateway
+
+Why monkey-patching: Hermes's TTS/STT system uses a provider-dispatch
+pattern inside existing tools (text_to_speech_tool / transcribe_audio).
+Registering new tools would create separate tool names the LLM can't
+use — the monkey-patch intercepts the existing dispatch so the LLM
+calls the same tool and gets routed to volcengine transparently.
 """
 import logging
 
 logger = logging.getLogger(__name__)
 
 
+_VOICE_INSTRUCTION = (
+    "You are responding via voice. Keep replies concise (2-4 sentences), "
+    "use natural conversational tone, avoid markdown formatting that doesn't "
+    "read well aloud (no tables, no code blocks unless asked), and speak "
+    "directly to the user without meta-commentary."
+)
+
+
+def _pre_llm_inject_voice_context(
+    session_id: str,
+    user_message: str,
+    conversation_history: list,
+    is_first_turn: bool,
+    model: str,
+    platform: str,
+    **kwargs,
+):
+    """Inject voice-friendly instructions when volcengine is the TTS provider."""
+    try:
+        import tools.tts_tool as tts_module
+        tts_config = tts_module._load_tts_config()
+        provider = tts_module._get_provider(tts_config)
+        if provider == "volcengine":
+            return {"context": _VOICE_INSTRUCTION}
+    except Exception:
+        pass
+    return None
+
+
 def register(ctx) -> None:
-    """Monkey-patch the TTS dispatch to support volcengine provider."""
+    """Monkey-patch the TTS/STT dispatch and register hooks."""
 
     # ── Patch TTS ──────────────────────────────────────────────────
     import tools.tts_tool as tts_module
@@ -102,3 +139,7 @@ def register(ctx) -> None:
 
     stt_module.transcribe_audio = patched_transcribe_audio
     logger.info("volcengine-voice: patched transcribe_audio ← volcengine provider")
+
+    # ── Register hooks ───────────────────────────────────────────
+    ctx.register_hook("pre_llm_call", _pre_llm_inject_voice_context)
+    logger.info("volcengine-voice: registered pre_llm_call hook")

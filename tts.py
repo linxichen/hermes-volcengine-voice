@@ -7,8 +7,9 @@ Auth: X-Api-Key + X-Api-Resource-Id: seed-tts-2.0
 import json
 import logging
 import os
+import re
 import uuid
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,34 @@ DEFAULT_RESOURCE_ID = "seed-tts-2.0"
 API_URL = "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
 
 
+def extract_emotion_and_clean_text(raw_text: str) -> tuple[str, Optional[List[str]]]:
+    """
+    从 raw_text 中提取方括号内的情绪指令，返回 (clean_text, context_texts)
+    例如: "[开心的语气] 今天天气真好" -> ("今天天气真好", ["用开心的语气说"])
+    支持多个指令: "[开心][快速] 你好" -> ("你好", ["用开心的语气说", "用快速的语气说"])
+    只支持2.0!!!
+    """
+    pattern = r'\[([^\]]+)\]'
+    matches = re.findall(pattern, raw_text)
+    if not matches:
+        return raw_text, None
+
+    instructions = []
+    for m in matches:
+        m = m.strip()
+        if not m.startswith("用"):
+            m = f"用{m}的语气说"
+        instructions.append(m)
+
+    # 移除所有方括号及其内容
+    clean_text = re.sub(pattern, '', raw_text).strip()
+    # 如果去除后为空，保留原文本（防止全标记情况）
+    if not clean_text:
+        clean_text = raw_text
+
+    return clean_text, instructions
+
+
 def _volcengine_tts(
     text: str,
     output_path: str,
@@ -48,6 +77,7 @@ def _volcengine_tts(
     Returns the output_path on success. Raises on failure.
     """
     import requests
+    import base64
 
     api_key = os.getenv("VOLCENGINE_VOICE_API_KEY", "")
     if not api_key:
@@ -55,42 +85,56 @@ def _volcengine_tts(
 
     cfg = tts_config.get("volcengine", {}) if tts_config else {}
     speaker_raw = cfg.get("speaker", DEFAULT_SPEAKER)
-    # Resolve short name → voice_type (e.g. zh_female_conversation → zh_female_shuangkuaisisi_uranus_bigtts)
     speaker = VOICES.get(speaker_raw, speaker_raw)
     sample_rate = cfg.get("sample_rate", 24000)
     audio_format = "mp3" if output_path.endswith(".mp3") else "ogg_opus"
 
-    # Resolve resource_id: config override > speaker map > default
     resource_id = cfg.get("resource_id") or SPEAKER_RESOURCE_MAP.get(speaker, DEFAULT_RESOURCE_ID)
+
+    # ---------- 新增：提取情绪指令并清理文本 ----------
+    clean_text, context_texts = extract_emotion_and_clean_text(text)
+
+    # 构建 additions 字典
+    additions = {
+        "disable_markdown_filter": False,
+        "disable_emoji_filter": False,
+        "enable_latex_tn": True,
+    }
+    if context_texts:
+        additions["context_texts"] = context_texts
+
+    additions_json = json.dumps(additions)
 
     headers = {
         "X-Api-Key": api_key,
         "X-Api-Resource-Id": resource_id,
         "X-Api-Request-Id": str(uuid.uuid4()),
         "Content-Type": "application/json",
+        "Connection": "keep-alive",
+        "X-Control-Require-Usage-Tokens-Return": "*",  # 可选，但官方示例推荐
     }
 
     payload = {
         "user": {"uid": "hermes-agent"},
         "req_params": {
-            "text": text,
+            "text": clean_text,          # 使用纯净文本（情绪标记已剥离）
             "speaker": speaker,
             "audio_params": {
                 "format": audio_format,
                 "sample_rate": sample_rate,
             },
+            "additions": additions_json,
         },
     }
 
     logger.info(
-        "Volcengine TTS: speaker=%s text_len=%d format=%s",
-        speaker, len(text), audio_format,
+        "Volcengine TTS: speaker=%s clean_text_len=%d format=%s context=%s",
+        speaker, len(clean_text), audio_format, context_texts,
     )
 
     resp = requests.post(API_URL, json=payload, headers=headers, stream=True, timeout=60)
     resp.raise_for_status()
 
-    # Streamed JSON-line response: each line is a JSON object with base64 data
     audio_chunks: list[bytes] = []
     for line in resp.iter_lines(decode_unicode=True):
         if not line:
@@ -103,10 +147,8 @@ def _volcengine_tts(
 
         data_b64 = chunk.get("data", "")
         if data_b64:
-            import base64
             audio_chunks.append(base64.b64decode(data_b64))
 
-        # Check for error (20000000 = end-of-stream OK marker, not an error)
         code = chunk.get("code", 0)
         if code != 0 and code != 20000000:
             msg = chunk.get("message", "unknown error")

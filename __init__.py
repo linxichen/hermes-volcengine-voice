@@ -28,7 +28,11 @@ _VOICE_INSTRUCTION = (
     "You are responding via voice. Keep replies concise (2-4 sentences), "
     "use natural conversational tone, avoid markdown formatting that doesn't "
     "read well aloud (no tables, no code blocks unless asked), and speak "
-    "directly to the user without meta-commentary."
+    "directly to the user without meta-commentary. "
+    "When you want to control the speaking style, prefix your TTS text with "
+    "one or more [emotion] markers, e.g. '[开心] 今天天气真好' or "
+    "'[开心][快速] 你好'; the bracketed part is a non-billed style "
+    "instruction and is stripped from the spoken text."
 )
 
 

@@ -1,8 +1,11 @@
 # Hermes Volcengine Voice Plugin
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Hermes Plugin](https://img.shields.io/badge/Hermes-plugin-4b8bbe.svg)](https://hermes-agent.nousresearch.com/docs/developer-guide/plugins)
+
 > 🌋 火山引擎豆包语音合成 & 识别插件 for [Hermes Agent](https://github.com/NousResearch/hermes-agent)
 
-Adds **Volcengine (火山引擎) Doubao (豆包)** TTS and STT as voice providers to Hermes Agent via monkey-patch plugin.
+Adds **Volcengine (火山引擎) Doubao (豆包)** TTS and STT as voice providers to Hermes Agent via monkey-patch plugin — 60+ Chinese voices, emotion control, dialect support, speaker diarization.
 
 ## ✨ Features
 
@@ -17,6 +20,9 @@ Adds **Volcengine (火山引擎) Doubao (豆包)** TTS and STT as voice provider
 ```bash
 # Clone into Hermes plugins directory
 git clone https://github.com/linxichen/hermes-volcengine-voice.git ~/.hermes/plugins/volcengine-voice
+
+# Or install straight from GitHub (equivalent)
+hermes plugins install linxichen/hermes-volcengine-voice
 
 # Enable in config.yaml
 hermes config set plugins.enabled --append volcengine-voice
@@ -81,6 +87,23 @@ Once configured, Hermes uses Volcengine for all TTS and STT automatically:
 - **不计费**：标记内容通过 `context_texts` 字段传给火山引擎，该字段不计费——只有 `text` 的字符数计费。
 - **需要 2.0 音色**：`context_texts` 仅在 `seed-tts-2.0`（`_uranus_` 系列 + seed-tts-2.0）上生效；1.0 音色（如 `zh_male_conversation`）会忽略标记，按原文本朗读。
 - **效果差异**：不同音色对情绪指令的响应差异较大（Vivi 响应明显，有些音色几乎没反应），请按需尝试。
+
+## 🎧 试听 Demo（情绪指令 + 音色）
+
+所有片段朗读同一句话，只换 `[情绪]` 标记和音色，方便对比效果。也可以运行 [`docs/demo/generate_demo.py`](docs/demo/generate_demo.py) 用你的 API Key 重新生成：
+
+| 片段 | 音色 | 情绪标记 |
+|------|------|---------|
+| [sisi-happy.mp3](docs/demo/sisi-happy.mp3) | 爽快思思 2.0（默认） | `[开心]` |
+| [sisi-sad.mp3](docs/demo/sisi-sad.mp3) | 爽快思思 2.0 | `[伤心]` |
+| [sisi-angry.mp3](docs/demo/sisi-angry.mp3) | 爽快思思 2.0 | `[生气]` |
+| [sisi-fast.mp3](docs/demo/sisi-fast.mp3) | 爽快思思 2.0 | `[快速]` |
+| [vivi-happy.mp3](docs/demo/vivi-happy.mp3) | Vivi 2.0 温柔女声 | `[开心]` |
+| [vivi-gentle.mp3](docs/demo/vivi-gentle.mp3) | Vivi 2.0 温柔女声 | `[温柔]` |
+| [xiaoyuan-happy.mp3](docs/demo/xiaoyuan-happy.mp3) | 甜美小源 2.0 | `[开心]` |
+| [xiaoyuan-angry.mp3](docs/demo/xiaoyuan-angry.mp3) | 甜美小源 2.0 | `[生气]` |
+| [yichen-serious.mp3](docs/demo/yichen-serious.mp3) | 儒雅逸辰 2.0（男声） | `[严肃]` |
+| [yichen-happy.mp3](docs/demo/yichen-happy.mp3) | 儒雅逸辰 2.0（男声） | `[开心]` |
 
 ## 🎵 Voice List
 

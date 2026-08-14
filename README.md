@@ -76,6 +76,8 @@ Once configured, Hermes uses Volcengine for all TTS and STT automatically:
 
 ## 🎭 情绪指令（`[情绪] 文本`）
 
+> ✍️ **情绪指令功能由社区贡献者 [@BartmossW](https://github.com/BartmossW) 开发并提交（[PR #1](https://github.com/linxichen/hermes-volcengine-voice/pull/1)）**，感谢贡献！
+
 在 TTS 文本**开头**加 `[情绪]` 标记即可控制朗读风格，开箱即用（插件已把该格式声明注入到语音回复的模型上下文里）：
 
 ```

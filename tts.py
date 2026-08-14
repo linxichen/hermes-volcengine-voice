@@ -7,6 +7,7 @@ Auth: X-Api-Key + X-Api-Resource-Id: seed-tts-2.0
 import json
 import logging
 import os
+import re
 import uuid
 from typing import Dict, Any
 
@@ -38,6 +39,44 @@ DEFAULT_RESOURCE_ID = "seed-tts-2.0"
 API_URL = "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
 
 
+_EMOTION_PREFIX = re.compile(r'^(?:\s*\[([^\[\]]+)\])+\s*')
+_TAG = re.compile(r'\[([^\[\]]+)\]')
+
+
+def _as_instruction(tag: str) -> str:
+    """把裸的情绪标记包装成自然语言指令。"""
+    if tag.startswith("用") or tag.endswith("说"):
+        return tag
+    if tag.endswith("语气") or tag.endswith("情绪"):
+        return f"用{tag}说"
+    return f"用{tag}的语气说"
+
+
+def extract_emotion_and_clean_text(raw_text: str) -> tuple[str, list[str] | None]:
+    """从 raw_text 开头提取方括号情绪指令，返回 (clean_text, context_texts)。
+
+    只识别开头的标记，正文中的方括号（引用编号、markdown 链接、list[str] 等）
+    保持原样。没有标记时原样返回。
+
+    "[开心] 今天天气真好"  -> ("今天天气真好", ["用开心的语气说"])
+    "[开心][快速] 你好"    -> ("你好", ["用开心的语气说", "用快速的语气说"])
+    "参考 [1] 和 [2]"      -> ("参考 [1] 和 [2]", None)
+
+    注意：context_texts 仅 2.0 音色（seed-tts-2.0）支持。
+    """
+    m = _EMOTION_PREFIX.match(raw_text)
+    if not m:
+        return raw_text, None
+
+    instructions = [_as_instruction(t.strip()) for t in _TAG.findall(m.group(0)) if t.strip()]
+    clean_text = raw_text[m.end():].strip()
+    # 全是标记、或标记为空 → 当作普通文本，不做处理
+    if not clean_text or not instructions:
+        return raw_text, None
+
+    return clean_text, instructions
+
+
 def _volcengine_tts(
     text: str,
     output_path: str,
@@ -63,6 +102,14 @@ def _volcengine_tts(
     # Resolve resource_id: config override > speaker map > default
     resource_id = cfg.get("resource_id") or SPEAKER_RESOURCE_MAP.get(speaker, DEFAULT_RESOURCE_ID)
 
+    # 提取开头的 [情绪] 标记并剥离正文
+    clean_text, context_texts = extract_emotion_and_clean_text(text)
+
+    # context_texts 不计费，但仅 2.0 音色（seed-tts-2.0）支持；无标记时不带 additions
+    additions: Dict[str, Any] = {}
+    if context_texts and resource_id == "seed-tts-2.0":
+        additions["context_texts"] = context_texts
+
     headers = {
         "X-Api-Key": api_key,
         "X-Api-Resource-Id": resource_id,
@@ -73,7 +120,7 @@ def _volcengine_tts(
     payload = {
         "user": {"uid": "hermes-agent"},
         "req_params": {
-            "text": text,
+            "text": clean_text,  # 情绪标记已剥离
             "speaker": speaker,
             "audio_params": {
                 "format": audio_format,
@@ -81,10 +128,13 @@ def _volcengine_tts(
             },
         },
     }
+    if additions:
+        # req_params.additions 要求 JSON 序列化后的字符串，而不是对象
+        payload["req_params"]["additions"] = json.dumps(additions)
 
     logger.info(
-        "Volcengine TTS: speaker=%s text_len=%d format=%s",
-        speaker, len(text), audio_format,
+        "Volcengine TTS: speaker=%s clean_text_len=%d format=%s context=%s",
+        speaker, len(clean_text), audio_format, context_texts,
     )
 
     resp = requests.post(API_URL, json=payload, headers=headers, stream=True, timeout=60)

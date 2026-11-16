@@ -41,6 +41,16 @@ an Ark key but no explicit flag stops cleaning until it opts in.
   return the raw transcript; incomplete `finish_reason` and Arabic digit
   sequences (compared in order) are rejected; inputs over 4000 characters skip
   the stage and `max_tokens` is sized from the input.
+- **Key-source-aware Ark defaults** — a Coding key
+  (`VOLCENGINE_CODING_API_KEY`) keeps the coding endpoint and
+  `doubao-seed-2.1-lite` (unverified); `VOLCENGINE_ARK_API_KEY` / `ARK_API_KEY`
+  use `https://ark.cn-beijing.volces.com/api/v3/chat/completions` and
+  `doubao-seed-2-0-lite-260428` (verified 2026-11-16). Explicit
+  `stt.volcengine.ark_endpoint` / `llm_model` always win.
+- **Ark HTTP error detail** — HTTP failures now log the Ark error code and
+  message from the response body (e.g. `InvalidSubscription`, `ModelNotOpen`)
+  before falling back to the raw transcript; keys and Authorization headers are
+  never logged.
 - **Optional Ark secrets declared, not required** — `VOLCENGINE_ARK_API_KEY`,
   `VOLCENGINE_CODING_API_KEY` and `ARK_API_KEY` are declared as optional
   `config_schema` secrets and read through `agent.secret_scope.get_secret()`.

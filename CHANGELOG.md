@@ -5,6 +5,12 @@
 Migrated the plugin to Hermes's public provider APIs and hardened the optional
 LLM transcript cleanup.
 
+### Upgrade note
+
+v1.2.0 enabled LLM cleanup automatically whenever an Ark key was present. v2.0.0
+requires `stt.volcengine.enable_llm_postprocess: true`; an existing install with
+an Ark key but no explicit flag stops cleaning until it opts in.
+
 ### Changed
 
 - **Public provider registration** — `tts.provider: volcengine` now resolves
@@ -15,14 +21,15 @@ LLM transcript cleanup.
   `tools.transcription_tools.transcribe_audio`, and no longer imports private
   `tools.*` modules.
 - **`pre_llm_call` stays public** — the hook now reads `tts.provider` through
-  `hermes_cli.config.load_config()` instead of `tools.tts_tool` internals.
+  `hermes_cli.config.load_config_readonly()` instead of `tools.tts_tool`
+  internals.
 - **Config keys unchanged** — `tts.provider: volcengine`,
   `stt.provider: volcengine`, `tts.volcengine.*` and `stt.volcengine.*` keep
   working.
 - **Chat-context feature removed** — no `state.db` read, no `enable_context`
   setting, no cross-session history injection.
-- Requires Hermes >= 0.21.6, the first release containing both
-  `register_tts_provider()` and `register_transcription_provider()`.
+- Requires Hermes >= 0.21.6 (minimum tested on 0.22.2 / `6e9b3e3b88` and
+  `1c0cd66`; the provider APIs actually date from `v2026.5.28` / 0.15.0).
 
 ### Added
 
@@ -31,9 +38,13 @@ LLM transcript cleanup.
   key alone never enables it. The transcript is sent to Volcengine Ark; hotwords
   and `domain_prompt` remain available.
 - **Fail-open and integrity guards** — configuration/request/response errors
-  return the raw transcript; incomplete `finish_reason` and digit-sequence
-  changes are rejected; inputs over 4000 characters skip the stage and
-  `max_tokens` is sized from the input.
+  return the raw transcript; incomplete `finish_reason` and Arabic digit
+  sequences (compared in order) are rejected; inputs over 4000 characters skip
+  the stage and `max_tokens` is sized from the input.
+- **Optional Ark secrets declared, not required** — `VOLCENGINE_ARK_API_KEY`,
+  `VOLCENGINE_CODING_API_KEY` and `ARK_API_KEY` are declared as optional
+  `config_schema` secrets and read through `agent.secret_scope.get_secret()`.
+  No Ark key is read from `config.yaml`.
 - **Data framing** — the transcript is delimited as data and the model is told
   never to answer or act on it.
 - Tests for provider registration, the opt-in matrix, fail-open behavior,

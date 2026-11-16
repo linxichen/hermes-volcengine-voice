@@ -1,9 +1,34 @@
 name: volcengine-voice
-version: 1.2.0
-description: Volcengine (火山引擎) Doubao TTS & STT provider for Hermes Agent — 60+ Chinese voices, emotion control, smart LLM post-processing & context-aware STT
-kind: provider
+version: 2.0.0
+description: Volcengine (火山引擎) Doubao TTS & STT provider for Hermes Agent via public provider APIs — Chinese voices, emotion control, optional opt-in LLM transcript cleanup
+kind: standalone
 author: Linxi Chen
 provides_hooks:
   - pre_llm_call
 requires_env:
   - VOLCENGINE_VOICE_API_KEY
+# Optional Ark keys for opt-in LLM cleanup. Declared as secret settings so they
+# are stored through Hermes's .env route; never required and never in config.yaml.
+config_schema:
+  ark_api_key:
+    type: secret
+    env: VOLCENGINE_ARK_API_KEY
+    label: Volcengine Ark API key (optional)
+    description: Used only when stt.volcengine.enable_llm_postprocess is true.
+  coding_api_key:
+    type: secret
+    env: VOLCENGINE_CODING_API_KEY
+    label: Volcengine Coding API key (optional)
+    description: Used only when stt.volcengine.enable_llm_postprocess is true.
+  generic_ark_key:
+    type: secret
+    env: ARK_API_KEY
+    label: Generic Ark API key (optional fallback, shared)
+    description: >-
+      Used only when stt.volcengine.enable_llm_postprocess is true. ARK_API_KEY
+      is a shared variable that other plugins (e.g. image generation) may also
+      read; changing it here changes it for them too.
+# Minimum tested floor: 0.22.2 (6e9b3e3b88) and 1c0cd66. The provider APIs
+# landed in v2026.5.28 (0.15.0); 0.21.6 is a conservative tested floor, not the
+# first release that contains them.
+requires_hermes: ">=0.21.6"

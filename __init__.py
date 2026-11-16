@@ -1,149 +1,39 @@
 """
 Volcengine (Doubao) Voice Plugin for Hermes Agent.
 
-Adds 'volcengine' as a TTS and STT provider by monkey-patching the
-Hermes dispatch layer. Also registers a pre_llm_call hook that injects
-voice-friendly response instructions when volcengine is the active provider.
+Registers ``volcengine`` on Hermes's public provider surfaces:
+
+* ``ctx.register_tts_provider(...)`` — Doubao TTS 2.0
+* ``ctx.register_transcription_provider(...)`` — Doubao Bigmodel ASR
+* ``ctx.register_hook("pre_llm_call", ...)`` — voice-friendly reply guidance
 
 Usage:
-  1. Set VOLCENGINE_VOICE_API_KEY in ~/.hermes/env.d/volcengine.env
+  1. Set VOLCENGINE_VOICE_API_KEY in the active profile's Hermes home .env
+     (default ~/.hermes/.env)
   2. Set config.yaml:
        tts.provider: volcengine
        stt.provider: volcengine
   3. Enable: hermes plugins enable volcengine-voice
   4. Restart Hermes gateway
 
-Why monkey-patching: Hermes's TTS/STT system uses a provider-dispatch
-pattern inside existing tools (text_to_speech_tool / transcribe_audio).
-Registering new tools would create separate tool names the LLM can't
-use — the monkey-patch intercepts the existing dispatch so the LLM
-calls the same tool and gets routed to volcengine transparently.
+No Hermes core function, method, module attribute or private table is rebound;
+the tool dispatch stays owned by Hermes.
 """
+
 import logging
+
+from .provider import (
+    VolcengineTranscriptionProvider,
+    VolcengineTTSProvider,
+    pre_llm_voice_context,
+)
 
 logger = logging.getLogger(__name__)
 
 
-_VOICE_INSTRUCTION = (
-    "You are responding via voice. Keep replies concise (2-4 sentences), "
-    "use natural conversational tone, avoid markdown formatting that doesn't "
-    "read well aloud (no tables, no code blocks unless asked), and speak "
-    "directly to the user without meta-commentary. "
-    "When you want to control the speaking style, prefix your TTS text with "
-    "one or more [emotion] markers, e.g. '[开心] 今天天气真好' or "
-    "'[开心][快速] 你好'; the bracketed part is a non-billed style "
-    "instruction and is stripped from the spoken text."
-)
-
-
-def _pre_llm_inject_voice_context(
-    session_id: str,
-    user_message: str,
-    conversation_history: list,
-    is_first_turn: bool,
-    model: str,
-    platform: str,
-    **kwargs,
-):
-    """Inject voice-friendly instructions when volcengine is the TTS provider."""
-    try:
-        import tools.tts_tool as tts_module
-        tts_config = tts_module._load_tts_config()
-        provider = tts_module._get_provider(tts_config)
-        if provider == "volcengine":
-            return {"context": _VOICE_INSTRUCTION}
-    except Exception:
-        pass
-    return None
-
-
 def register(ctx) -> None:
-    """Monkey-patch the TTS/STT dispatch and register hooks."""
-
-    # ── Patch TTS ──────────────────────────────────────────────────
-    import tools.tts_tool as tts_module
-
-    _original_tts = tts_module.text_to_speech_tool
-
-    def patched_text_to_speech(text: str, output_path=None):
-        """Wrapped TTS: if provider is 'volcengine', route to Doubao API."""
-        tts_config = tts_module._load_tts_config()
-        provider = tts_module._get_provider(tts_config)
-
-        if provider != "volcengine":
-            return _original_tts(text, output_path)
-
-        # ── Volcengine path ─────────────────────────────────────
-        import datetime
-        import json as _json
-        import os as _os
-        from pathlib import Path as _Path
-
-        from hermes_plugins.volcengine_voice.tts import _volcengine_tts
-
-        if not text or not text.strip():
-            return tts_module.tool_error("Text is required", success=False)
-
-        # Truncate long text
-        max_len = 5000
-        if len(text) > max_len:
-            logger.warning("Volcengine TTS: truncating %d chars to %d", len(text), max_len)
-            text = text[:max_len]
-
-        # Determine output path
-        if output_path:
-            file_path = _Path(output_path).expanduser()
-        else:
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            out_dir = _Path(tts_module.DEFAULT_OUTPUT_DIR)
-            out_dir.mkdir(parents=True, exist_ok=True)
-            file_path = out_dir / f"tts_{timestamp}.mp3"
-
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_str = str(file_path)
-
-        try:
-            _volcengine_tts(text, file_str, tts_config)
-        except Exception as e:
-            logger.error("Volcengine TTS failed: %s", e)
-            return _json.dumps({
-                "success": False,
-                "error": f"Volcengine TTS error: {e}",
-            }, ensure_ascii=False)
-
-        media_tag = f"MEDIA:{file_str}"
-        return _json.dumps({
-            "success": True,
-            "file_path": file_str,
-            "media_tag": media_tag,
-            "provider": "volcengine",
-        }, ensure_ascii=False)
-
-    # Replace the function reference in the module
-    tts_module.text_to_speech_tool = patched_text_to_speech
-    logger.info("volcengine-voice: patched text_to_speech_tool ← volcengine provider")
-
-    # ── Patch STT ──────────────────────────────────────────────────
-    import tools.transcription_tools as stt_module
-
-    _original_transcribe = stt_module.transcribe_audio
-
-    def patched_transcribe_audio(file_path, model=None, *args, **kwargs):
-        """Wrapped STT: if provider is 'volcengine', route to Doubao ASR."""
-        stt_config = stt_module._load_stt_config()
-        provider = stt_module._get_provider(stt_config)
-
-        if provider != "volcengine":
-            return _original_transcribe(file_path, model, *args, **kwargs)
-
-        from hermes_plugins.volcengine_voice.stt import volcengine_transcribe
-
-        logger.info("Volcengine STT: transcribing %s...", file_path)
-        return volcengine_transcribe(file_path, stt_config, **kwargs)
-
-    stt_module.transcribe_audio = patched_transcribe_audio
-    logger.info("volcengine-voice: patched transcribe_audio ← volcengine provider")
-
-    # ── Register hooks ───────────────────────────────────────────
-    ctx.register_hook("pre_llm_call", _pre_llm_inject_voice_context)
-    logger.info("volcengine-voice: registered pre_llm_call hook")
+    """Register both providers and the voice-context hook."""
+    ctx.register_tts_provider(VolcengineTTSProvider())
+    ctx.register_transcription_provider(VolcengineTranscriptionProvider())
+    ctx.register_hook("pre_llm_call", pre_llm_voice_context)
+    logger.info("volcengine-voice: registered TTS/STT providers and pre_llm_call hook")

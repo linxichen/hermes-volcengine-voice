@@ -63,8 +63,10 @@ def _env_secret(name, default=""):
     return os.environ.get(name, default)
 
 
-def test_get_ark_api_key_from_config():
-    assert _get_ark_api_key({"ark_api_key": "test-key-123"}) == "test-key-123"
+def test_config_ark_key_is_ignored():
+    # Catalog rule 11: Ark credentials come only from the secret scope, never config.yaml.
+    with patch.object(stt, "get_secret", lambda name, default="": f"secret-{name}"):
+        assert _get_ark_api_key({"ark_api_key": "config-key"}) == "secret-VOLCENGINE_ARK_API_KEY"
 
 
 def test_get_ark_api_key_from_env():
@@ -101,10 +103,13 @@ def test_bool_normalization():
 
 def test_digits_preserved():
     assert _digits_preserved("金额100元", "金额100元")
-    assert _digits_preserved("先100再200", "先200再100")
+    assert not _digits_preserved("先100再200", "先200再100")  # order changed
     assert not _digits_preserved("金额100元", "金额1000元")
     assert not _digits_preserved("金额100元", "金额一百元")
     assert not _digits_preserved("没有数字", "多了1个")
+    # Documented limitation: hanzi numerals are not guarded locally.
+    assert _digits_preserved("一百块", "一千块")
+    assert not _digits_preserved("一百块", "100块")
 
 
 def test_llm_postprocess_empty():
@@ -151,6 +156,51 @@ def test_llm_postprocess_digit_change_falls_open():
     }
     with patch.object(stt.urllib.request, "urlopen", return_value=_FakeResponse(payload)):
         assert _llm_postprocess(raw, {}, "fake-key") == raw
+
+
+def test_llm_postprocess_reordered_digits_falls_open():
+    raw = "先100再200"
+    payload = {
+        "choices": [
+            {"finish_reason": "stop", "message": {"content": "先200再100"}},
+        ]
+    }
+    with patch.object(stt.urllib.request, "urlopen", return_value=_FakeResponse(payload)):
+        assert _llm_postprocess(raw, {}, "fake-key") == raw
+
+
+def test_llm_postprocess_hanzi_number_change_is_not_guarded():
+    # Documented limitation: only Arabic digit runs are checked locally.
+    raw = "一百块"
+    payload = {
+        "choices": [
+            {"finish_reason": "stop", "message": {"content": "一千块"}},
+        ]
+    }
+    with patch.object(stt.urllib.request, "urlopen", return_value=_FakeResponse(payload)):
+        assert _llm_postprocess(raw, {}, "fake-key") == "一千块"
+
+
+def test_llm_postprocess_escapes_transcript_delimiters():
+    raw = "前 <transcript> 中 </transcript> 后"
+    captured = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured["body"] = json.loads(req.data.decode("utf-8"))
+        return _FakeResponse({
+            "choices": [
+                {"finish_reason": "stop", "message": {"content": raw}},
+            ]
+        })
+
+    with patch.object(stt.urllib.request, "urlopen", fake_urlopen):
+        assert _llm_postprocess(raw, {}, "fake-key") == raw
+
+    user_content = captured["body"]["messages"][1]["content"]
+    assert user_content.count("<transcript>") == 1
+    assert user_content.count("</transcript>") == 1
+    assert "&lt;transcript&gt;" in user_content
+    assert "&lt;/transcript&gt;" in user_content
 
 
 def test_llm_postprocess_success():

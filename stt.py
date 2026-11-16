@@ -222,7 +222,8 @@ def _get_api_key() -> str:
     if not key:
         raise ValueError(
             "VOLCENGINE_VOICE_API_KEY not set. "
-            "Add it to ~/.hermes/env.d/volcengine.env or set the environment variable."
+            "Add it to the active profile's Hermes home .env (default ~/.hermes/.env) "
+            "or set the environment variable."
         )
     return key
 
@@ -263,10 +264,12 @@ def _normalize_bool(value: Any, *, default: bool, setting: str) -> bool:
 
 
 def _get_ark_api_key(vc_config: dict[str, Any]) -> str:
-    """Retrieve the Volcengine Ark (LLM) API key from config or the secret scope."""
-    configured = vc_config.get("ark_api_key") if isinstance(vc_config, dict) else None
-    if isinstance(configured, str) and configured.strip():
-        return configured.strip()
+    """Retrieve the optional Volcengine Ark (LLM) API key from the secret scope.
+
+    The key is never read from ``config.yaml``: catalog rule 11 requires
+    credentials through Hermes's profile-aware secret route. *vc_config* is
+    accepted for call-site compatibility but deliberately unused.
+    """
     for name in ("VOLCENGINE_ARK_API_KEY", "VOLCENGINE_CODING_API_KEY", "ARK_API_KEY"):
         value = get_secret(name)
         if value:
@@ -282,8 +285,21 @@ _DIGIT_RUN = re.compile(r"\d+")
 
 
 def _digits_preserved(raw_text: str, result: str) -> bool:
-    """The prompt promises digits are never changed; reject any detected change."""
-    return sorted(_DIGIT_RUN.findall(raw_text)) == sorted(_DIGIT_RUN.findall(result))
+    """Compare Arabic digit runs in order.
+
+    The prompt promises digits are never changed; a changed, added, removed or
+    reordered Arabic digit run rejects the model output. Hanzi numerals
+    (一/十/百/千/万...) are not guarded locally because those characters also
+    occur in ordinary words; they rely on the prompt only.
+    """
+    return _DIGIT_RUN.findall(raw_text) == _DIGIT_RUN.findall(result)
+
+
+def _escape_transcript_delimiters(text: str) -> str:
+    """Keep transcript text from closing or reopening the data frame."""
+    return text.replace("</transcript>", "&lt;/transcript&gt;").replace(
+        "<transcript>", "&lt;transcript&gt;"
+    )
 
 
 def _llm_postprocess(raw_text: str, vc_config: dict[str, Any], ark_key: str) -> str:
@@ -346,7 +362,7 @@ def _llm_postprocess(raw_text: str, vc_config: dict[str, Any], ark_key: str) -> 
             "thinking": {"type": "disabled"},
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"<transcript>\n{raw_text}\n</transcript>"},
+                {"role": "user", "content": f"<transcript>\n{_escape_transcript_delimiters(raw_text)}\n</transcript>"},
             ],
             "temperature": 0.1,
             "max_tokens": max_tokens,

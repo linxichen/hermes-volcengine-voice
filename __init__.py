@@ -8,7 +8,8 @@ Registers ``volcengine`` on Hermes's public provider surfaces:
 * ``ctx.register_hook("pre_llm_call", ...)`` — voice-friendly reply guidance
 
 Usage:
-  1. Set VOLCENGINE_VOICE_API_KEY in ~/.hermes/env.d/volcengine.env
+  1. Set VOLCENGINE_VOICE_API_KEY in the active profile's Hermes home .env
+     (default ~/.hermes/.env)
   2. Set config.yaml:
        tts.provider: volcengine
        stt.provider: volcengine

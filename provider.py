@@ -162,8 +162,9 @@ class VolcengineTranscriptionProvider(TranscriptionProvider):
             api_key = runtime.get_secret("VOLCENGINE_VOICE_API_KEY")
             if not api_key:
                 return _stt_error(
-                    "VOLCENGINE_VOICE_API_KEY not set. Add it to "
-                    "~/.hermes/env.d/volcengine.env or set the environment variable."
+                    "VOLCENGINE_VOICE_API_KEY not set. Add it to the active "
+                    "profile's Hermes home .env (default ~/.hermes/.env) or set "
+                    "the environment variable."
                 )
             if extra.get("prompt"):
                 # The Volcengine ASR request has no documented prompt/vocabulary

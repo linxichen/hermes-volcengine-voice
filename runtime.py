@@ -1,10 +1,10 @@
 """Public Hermes surfaces used by the Volcengine voice plugin.
 
-Configuration is read through ``hermes_cli.config.load_config()`` (the documented
-``config.yaml`` accessor for plugins) and credentials through
-``agent.secret_scope.get_secret()`` (the profile-aware secret route named by the
-plugin catalog). No Hermes core module is imported for its private helpers and
-nothing is rebound.
+Configuration is read through ``hermes_cli.config.load_config_readonly()`` (the
+documented, non-mutating ``config.yaml`` accessor for plugins) and credentials
+through ``agent.secret_scope.get_secret()`` (the profile-aware secret route
+named by the plugin catalog). No Hermes core module is imported for its private
+helpers and nothing is rebound.
 """
 
 from __future__ import annotations
@@ -19,9 +19,9 @@ logger = logging.getLogger(__name__)
 def load_config_section(section: str) -> dict[str, Any]:
     """Return one top-level ``config.yaml`` section, or ``{}`` when unavailable."""
     try:
-        from hermes_cli.config import load_config
+        from hermes_cli.config import load_config_readonly
 
-        config = load_config() or {}
+        config = load_config_readonly() or {}
         value = config.get(section)
         return value if isinstance(value, dict) else {}
     except Exception as exc:  # config read is best-effort; the caller keeps its defaults

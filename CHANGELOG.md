@@ -1,5 +1,50 @@
 # Changelog
 
+## [v2.0.0] - 2026-11-16
+
+Migrated the plugin to Hermes's public provider APIs and hardened the optional
+LLM transcript cleanup.
+
+### Changed
+
+- **Public provider registration** — `tts.provider: volcengine` now resolves
+  through `ctx.register_tts_provider()` (`TTSProvider`), and
+  `stt.provider: volcengine` through `ctx.register_transcription_provider()`
+  (`TranscriptionProvider`). The plugin no longer monkey-patches
+  `tools.tts_tool.text_to_speech_tool` or
+  `tools.transcription_tools.transcribe_audio`, and no longer imports private
+  `tools.*` modules.
+- **`pre_llm_call` stays public** — the hook now reads `tts.provider` through
+  `hermes_cli.config.load_config()` instead of `tools.tts_tool` internals.
+- **Config keys unchanged** — `tts.provider: volcengine`,
+  `stt.provider: volcengine`, `tts.volcengine.*` and `stt.volcengine.*` keep
+  working.
+- **Chat-context feature removed** — no `state.db` read, no `enable_context`
+  setting, no cross-session history injection.
+- Requires Hermes >= 0.21.6, the first release containing both
+  `register_tts_provider()` and `register_transcription_provider()`.
+
+### Added
+
+- **Opt-in LLM post-processing** — off by default; runs only when
+  `stt.volcengine.enable_llm_postprocess` is explicitly `true`. A present Ark
+  key alone never enables it. The transcript is sent to Volcengine Ark; hotwords
+  and `domain_prompt` remain available.
+- **Fail-open and integrity guards** — configuration/request/response errors
+  return the raw transcript; incomplete `finish_reason` and digit-sequence
+  changes are rejected; inputs over 4000 characters skip the stage and
+  `max_tokens` is sized from the input.
+- **Data framing** — the transcript is delimited as data and the model is told
+  never to answer or act on it.
+- Tests for provider registration, the opt-in matrix, fail-open behavior,
+  truncation, digit changes, framing and the never-raising STT envelope.
+
+### Credits
+
+- [@peetteerr](https://github.com/peetteerr) for [PR #3](https://github.com/linxichen/hermes-volcengine-voice/pull/3),
+  which added the `*args`/`**kwargs` STT compatibility fix and the original
+  smart LLM post-processing work that this release hardens.
+
 ## [v0.1.0] - 2026-08-13
 
 Initial release of the Volcengine Doubao voice plugin for Hermes Agent.

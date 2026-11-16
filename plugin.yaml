@@ -1,9 +1,10 @@
 name: volcengine-voice
-version: 1.2.0
-description: Volcengine (火山引擎) Doubao TTS & STT provider for Hermes Agent — 60+ Chinese voices, emotion control, smart LLM post-processing & context-aware STT
-kind: provider
+version: 2.0.0
+description: Volcengine (火山引擎) Doubao TTS & STT provider for Hermes Agent via public provider APIs — Chinese voices, emotion control, optional opt-in LLM transcript cleanup
+kind: standalone
 author: Linxi Chen
 provides_hooks:
   - pre_llm_call
 requires_env:
   - VOLCENGINE_VOICE_API_KEY
+requires_hermes: ">=0.21.6"

@@ -11,7 +11,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+from pathlib import Path
+import sqlite3
 import struct
+import urllib.error
+import urllib.request
 import uuid
 from typing import Any
 
@@ -92,6 +97,13 @@ def volcengine_transcribe(
     if not transcript:
         return {"success": False, "error": "Volcengine ASR returned empty transcript"}
 
+    # Optional smart LLM post-processing (disfluency smoothing & context awareness)
+    enable_llm = vc_config.get("enable_llm_postprocess")
+    ark_key = _get_ark_api_key(vc_config)
+    # If explicitly enabled, or if Ark key is present and not explicitly disabled
+    if ark_key and (enable_llm is True or (enable_llm is None and ark_key)):
+        transcript = _llm_postprocess(transcript, vc_config, ark_key)
+
     return {
         "success": True,
         "transcript": transcript,
@@ -169,6 +181,192 @@ def _get_api_key() -> str:
             "Add it to ~/.hermes/env.d/volcengine.env or set the environment variable."
         )
     return key
+
+
+DEFAULT_LLM_SYSTEM_PROMPT = (
+    "你是一个高精度的语音识别（ASR）后处理专家。\n"
+    "你的任务是根据当前会话语境，对语音转写的初步文本进行平滑润色与纠错：\n"
+    "1. 抚平口吃、重复词与无意义语气助词（如\"然后然后\"、\"那个那个\"、\"就是就是\"），使表达通顺连贯。\n"
+    "2. 结合所提供的会话上下文（若有），纠正发音相近的同音错别字、专有名词与技术术语；遇到人名/术语歧义（多个写法都像）时，必须按上下文语义裁决指的是谁，拿不准才保留原文。\n"
+    "3. 严格忠实于说话人原意，严禁添枝加叶、虚构内容或擅自发散。\n"
+    "4. 绝不修改任何数字、金额、分数、代码符号或专有缩写。\n"
+    "5. 直接输出润色后的文本，绝不要输出任何解释说明、问答标签或前后缀。"
+)
+
+
+def _get_ark_api_key(vc_config: dict[str, Any]) -> str:
+    """Retrieve Volcengine Ark (LLM) API Key from config or environment."""
+    return (
+        vc_config.get("ark_api_key")
+        or os.getenv("VOLCENGINE_ARK_API_KEY")
+        or os.getenv("VOLCENGINE_CODING_API_KEY")
+        or os.getenv("ARK_API_KEY")
+        or ""
+    )
+
+
+def _strip_hidden(text: str) -> str:
+    """Elide content the user never saw (large code blocks / tool output); keep the rest verbatim."""
+
+    def repl(match: "re.Match[str]") -> str:
+        body = match.group(0)
+        return "\n……(code/tool content omitted)……\n" if len(body) > 200 else body
+
+    return re.sub(r"```.*?```", repl, text, flags=re.S)
+
+
+def _get_hermes_chat_context(max_chars: int = 8000) -> str:
+    """Read the adjacent conversation round from Hermes SQLite database (state.db).
+
+    The LLM corrects names/terms against the decision context the user actually
+    saw: the latest user message plus every visible assistant reply after it,
+    COMPLETE — no per-message truncation (a fixed 120-char prefix drops exactly
+    the names the correction depends on). Only content invisible to the user
+    (large code blocks / tool output) is elided. `max_chars` is a safety valve,
+    normally untouched. Read-only, non-blocking (timeout=0.5s).
+    """
+    candidates: list[Path] = []
+    env_home = os.environ.get("HERMES_HOME")
+    if env_home:
+        candidates.append(Path(env_home) / "state.db")
+
+    home = Path.home()
+    # Windows default AppData
+    candidates.append(home / "AppData" / "Local" / "hermes" / "state.db")
+    # Standard ~/.hermes
+    candidates.append(home / ".hermes" / "state.db")
+
+    db_path: Path | None = None
+    for cand in candidates:
+        if cand.is_file():
+            db_path = cand
+            break
+
+    if not db_path:
+        return ""
+
+    try:
+        uri = f"file:{db_path.as_posix()}?mode=ro"
+        with sqlite3.connect(uri, uri=True, timeout=0.5) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT session_id FROM messages WHERE content IS NOT NULL AND trim(content) != '' "
+                "ORDER BY id DESC LIMIT 1"
+            )
+            row = cursor.fetchone()
+            if not row or not row[0]:
+                return ""
+            latest_session_id = row[0]
+
+            # Adjacent round = latest user message (inclusive) + every visible
+            # reply after it, oldest first; fallbacks keep older sessions working.
+            cursor.execute(
+                "SELECT id, role, content FROM messages "
+                "WHERE session_id = ? AND role IN ('user', 'assistant') "
+                "AND content IS NOT NULL AND trim(content) != '' "
+                "AND id >= (SELECT MAX(id) FROM messages WHERE session_id = ? "
+                "AND role = 'user' AND content IS NOT NULL AND trim(content) != '') "
+                "ORDER BY id ASC LIMIT 12",
+                (latest_session_id, latest_session_id),
+            )
+            round_rows = cursor.fetchall()
+            if not round_rows:
+                cursor.execute(
+                    "SELECT id, role, content FROM messages "
+                    "WHERE session_id = ? AND role IN ('user', 'assistant') "
+                    "AND content IS NOT NULL AND trim(content) != '' "
+                    "ORDER BY id DESC LIMIT 2",
+                    (latest_session_id,),
+                )
+                round_rows = cursor.fetchall()[::-1]
+            elif len(round_rows) == 1:
+                # User message alone (no reply yet): pair it with the previous
+                # assistant reply so the model still sees one full round.
+                cursor.execute(
+                    "SELECT id, role, content FROM messages "
+                    "WHERE session_id = ? AND role = 'assistant' "
+                    "AND content IS NOT NULL AND trim(content) != '' AND id < ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (latest_session_id, round_rows[0][0]),
+                )
+                older = cursor.fetchone()
+                if older:
+                    round_rows = [older] + round_rows
+
+            lines: list[str] = []
+            for _, role, content in round_rows:  # already oldest-first
+                text = _strip_hidden(" ".join((content or "").strip().split()))
+                if not text or text.startswith("<tool_call>") or text.startswith("::preview"):
+                    continue
+                lines.append(f"[{role}]: {text}")
+
+            merged = "\n".join(lines)
+            return merged[-max_chars:] if len(merged) > max_chars else merged
+    except Exception as exc:
+        logger.debug("Failed to read Hermes chat context: %s", exc)
+        return ""
+
+
+def _llm_postprocess(raw_text: str, vc_config: dict[str, Any], ark_key: str) -> str:
+    """Smooth disfluencies and correct homophones using Doubao LLM."""
+    if not raw_text or not raw_text.strip():
+        return raw_text
+
+    system_prompt = vc_config.get("system_prompt") or DEFAULT_LLM_SYSTEM_PROMPT
+    domain_prompt = vc_config.get("domain_prompt")
+    if domain_prompt:
+        system_prompt += f"\n\n行业领域背景与规则说明:\n{domain_prompt}"
+
+    hotwords = vc_config.get("hotwords")
+    if hotwords and isinstance(hotwords, list):
+        system_prompt += f"\n\n领域热词参考(请优先纠偏为以下专有词汇):\n{', '.join(hotwords)}"
+
+    if vc_config.get("enable_context", True):
+        context = _get_hermes_chat_context()
+        if context:
+            system_prompt += f"\n\n当前会话上一轮完整对话(用户可见内容,仅供理解语境与人名指代,绝对不要把这部分内容混入输出):\n{context}"
+
+    endpoint = vc_config.get(
+        "ark_endpoint",
+        "https://ark.cn-beijing.volces.com/api/coding/v3/chat/completions",
+    )
+    model = vc_config.get("llm_model", "doubao-seed-2.1-lite")
+    timeout = float(vc_config.get("llm_timeout", 8.0))
+
+    payload = {
+        "model": model,
+        "thinking": {"type": "disabled"},
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": raw_text},
+        ],
+        "temperature": 0.1,
+        "max_tokens": 1024,
+    }
+
+    req = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {ark_key}",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            choices = data.get("choices", [])
+            if choices and choices[0].get("message", {}).get("content"):
+                result = choices[0]["message"]["content"].strip()
+                if result:
+                    logger.debug("Volcengine STT LLM postprocess: %r -> %r", raw_text, result)
+                    return result
+    except Exception as exc:
+        logger.warning("Volcengine STT: LLM post-processing bypassed due to error: %s", exc)
+
+    return raw_text
 
 
 def _transcribe_volcengine(

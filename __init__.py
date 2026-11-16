@@ -128,18 +128,18 @@ def register(ctx) -> None:
 
     _original_transcribe = stt_module.transcribe_audio
 
-    def patched_transcribe_audio(file_path, model=None):
+    def patched_transcribe_audio(file_path, model=None, *args, **kwargs):
         """Wrapped STT: if provider is 'volcengine', route to Doubao ASR."""
         stt_config = stt_module._load_stt_config()
         provider = stt_module._get_provider(stt_config)
 
         if provider != "volcengine":
-            return _original_transcribe(file_path, model)
+            return _original_transcribe(file_path, model, *args, **kwargs)
 
         from hermes_plugins.volcengine_voice.stt import volcengine_transcribe
 
         logger.info("Volcengine STT: transcribing %s...", file_path)
-        return volcengine_transcribe(file_path, stt_config)
+        return volcengine_transcribe(file_path, stt_config, **kwargs)
 
     stt_module.transcribe_audio = patched_transcribe_audio
     logger.info("volcengine-voice: patched transcribe_audio ← volcengine provider")

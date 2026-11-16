@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import struct
+import urllib.error
 import urllib.request
 import uuid
 from typing import Any, Optional
@@ -63,8 +64,11 @@ MAX_POSTPROCESS_CHARS = 4000
 MIN_OUTPUT_TOKENS = 256
 MAX_OUTPUT_TOKENS = 4096
 
-DEFAULT_ARK_ENDPOINT = "https://ark.cn-beijing.volces.com/api/coding/v3/chat/completions"
-DEFAULT_LLM_MODEL = "doubao-seed-2.1-lite"
+CODING_ARK_ENDPOINT = "https://ark.cn-beijing.volces.com/api/coding/v3/chat/completions"
+CODING_LLM_MODEL = "doubao-seed-2.1-lite"
+REGULAR_ARK_ENDPOINT = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+REGULAR_LLM_MODEL = "doubao-seed-2-0-lite-260428"
+ARK_KEY_ENV_ORDER = ("VOLCENGINE_ARK_API_KEY", "VOLCENGINE_CODING_API_KEY", "ARK_API_KEY")
 
 
 # ── Public API ─────────────────────────────────────────────────────────────
@@ -132,9 +136,14 @@ def volcengine_transcribe(
             default=False,
             setting="stt.volcengine.enable_llm_postprocess",
         ):
-            key = ark_key if isinstance(ark_key, str) and ark_key.strip() else _resolve_ark_key(vc_config)
+            if isinstance(ark_key, str) and ark_key.strip():
+                key, key_source = ark_key.strip(), ""
+            else:
+                key, key_source = _resolve_ark_credential(vc_config)
             if key:
-                transcript = _llm_postprocess(transcript, vc_config, key)
+                transcript = _llm_postprocess(
+                    transcript, vc_config, key, ark_key_source=key_source,
+                )
 
         return {
             "success": True,
@@ -263,22 +272,27 @@ def _normalize_bool(value: Any, *, default: bool, setting: str) -> bool:
     return default
 
 
+def _resolve_ark_credential(vc_config: dict[str, Any]) -> tuple[str, str]:
+    """Return ``(key, env_name)`` from the secret scope, first non-empty wins.
+
+    Precedence is VOLCENGINE_ARK_API_KEY > VOLCENGINE_CODING_API_KEY >
+    ARK_API_KEY. The env name selects the default endpoint/model: a Coding key
+    gets the coding endpoint, while regular Ark keys get the verified regular
+    endpoint. No Ark key is read from ``config.yaml`` (catalog rule 11).
+    """
+    for name in ARK_KEY_ENV_ORDER:
+        value = get_secret(name)
+        if value:
+            return value, name
+    return "", ""
+
+
 def _get_ark_api_key(vc_config: dict[str, Any]) -> str:
     """Retrieve the optional Volcengine Ark (LLM) API key from the secret scope.
 
-    The key is never read from ``config.yaml``: catalog rule 11 requires
-    credentials through Hermes's profile-aware secret route. *vc_config* is
-    accepted for call-site compatibility but deliberately unused.
+    *vc_config* is accepted for call-site compatibility but deliberately unused.
     """
-    for name in ("VOLCENGINE_ARK_API_KEY", "VOLCENGINE_CODING_API_KEY", "ARK_API_KEY"):
-        value = get_secret(name)
-        if value:
-            return value
-    return ""
-
-
-def _resolve_ark_key(vc_config: dict[str, Any]) -> str:
-    return _get_ark_api_key(vc_config)
+    return _resolve_ark_credential(vc_config)[0]
 
 
 _DIGIT_RUN = re.compile(r"\d+")
@@ -302,13 +316,55 @@ def _escape_transcript_delimiters(text: str) -> str:
     )
 
 
-def _llm_postprocess(raw_text: str, vc_config: dict[str, Any], ark_key: str) -> str:
+def _ark_error_detail(exc: BaseException) -> str:
+    """Describe an HTTP failure with Ark's error code/message, never the key."""
+    if not isinstance(exc, urllib.error.HTTPError):
+        return f"{type(exc).__name__}: {exc}"
+
+    body = ""
+    try:
+        body = exc.read().decode("utf-8", errors="replace")
+    except Exception:
+        pass
+
+    code = message = ""
+    try:
+        data = json.loads(body) if body else {}
+        if isinstance(data, dict):
+            error = data.get("error")
+            if isinstance(error, dict):
+                code = str(error.get("code") or error.get("type") or "")
+                message = str(error.get("message") or "")
+            code = code or str(data.get("code") or "")
+            message = message or str(data.get("message") or "")
+    except Exception:
+        pass
+
+    detail = f"HTTP {exc.code}"
+    if code:
+        detail += f" code={code}"
+    if message:
+        detail += f" message={message}"
+    if not code and not message and body:
+        detail += f" body={body[:500]}"
+    return detail
+
+
+def _llm_postprocess(
+    raw_text: str,
+    vc_config: dict[str, Any],
+    ark_key: str,
+    ark_key_source: str = "",
+) -> str:
     """Smooth disfluencies and correct homophones using Doubao LLM.
 
-    The whole optional stage fails open: any configuration, request-building or
-    response-parsing error returns the raw transcript. Incomplete output
-    (``finish_reason`` other than ``stop``), a digit change, or an oversized
-    input also returns the raw transcript.
+    Defaults follow the Ark key source: a Coding key uses the coding endpoint
+    and ``doubao-seed-2.1-lite``; regular Ark keys use the regular endpoint and
+    the dated ``doubao-seed-2-0-lite-260428``. Explicit ``ark_endpoint`` /
+    ``llm_model`` always win. The whole optional stage fails open: any
+    configuration, request-building or response-parsing error returns the raw
+    transcript. Incomplete output (``finish_reason`` other than ``stop``), a
+    digit change, or an oversized input also returns the raw transcript.
     """
     if not raw_text or not raw_text.strip():
         return raw_text
@@ -342,8 +398,12 @@ def _llm_postprocess(raw_text: str, vc_config: dict[str, Any], ark_key: str) -> 
 
         system_prompt += DATA_FRAMING
 
-        endpoint = vc_config.get("ark_endpoint", DEFAULT_ARK_ENDPOINT)
-        model = vc_config.get("llm_model", DEFAULT_LLM_MODEL)
+        if ark_key_source == "VOLCENGINE_CODING_API_KEY":
+            default_endpoint, default_model = CODING_ARK_ENDPOINT, CODING_LLM_MODEL
+        else:
+            default_endpoint, default_model = REGULAR_ARK_ENDPOINT, REGULAR_LLM_MODEL
+        endpoint = vc_config.get("ark_endpoint", default_endpoint)
+        model = vc_config.get("llm_model", default_model)
         if not isinstance(endpoint, str) or not endpoint.strip():
             raise ValueError("stt.volcengine.ark_endpoint must be a non-empty string")
         if not isinstance(model, str) or not model.strip():
@@ -405,7 +465,10 @@ def _llm_postprocess(raw_text: str, vc_config: dict[str, Any], ark_key: str) -> 
             logger.debug("Volcengine STT LLM postprocess: %r -> %r", raw_text, result)
             return result
     except Exception as exc:
-        logger.warning("Volcengine STT: LLM post-processing bypassed due to error: %s", exc)
+        logger.warning(
+            "Volcengine STT: LLM post-processing bypassed due to error: %s",
+            _ark_error_detail(exc),
+        )
 
     return raw_text
 

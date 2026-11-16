@@ -6,10 +6,12 @@ No network: every HTTP response is a local fake.
 from __future__ import annotations
 
 import json
+import io
 import os
 import sys
 import tempfile
 import types
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
@@ -24,6 +26,7 @@ from stt import (
     _get_ark_api_key,
     _llm_postprocess,
     _normalize_bool,
+    _resolve_ark_credential,
     volcengine_transcribe,
 )
 
@@ -69,6 +72,22 @@ def test_config_ark_key_is_ignored():
         assert _get_ark_api_key({"ark_api_key": "config-key"}) == "secret-VOLCENGINE_ARK_API_KEY"
 
 
+def test_ark_key_precedence():
+    values = {
+        "VOLCENGINE_ARK_API_KEY": "ark-key",
+        "VOLCENGINE_CODING_API_KEY": "coding-key",
+        "ARK_API_KEY": "generic-key",
+    }
+    with patch.object(stt, "get_secret", lambda name, default="": values.get(name, default)):
+        assert _resolve_ark_credential({}) == ("ark-key", "VOLCENGINE_ARK_API_KEY")
+        del values["VOLCENGINE_ARK_API_KEY"]
+        assert _resolve_ark_credential({}) == ("coding-key", "VOLCENGINE_CODING_API_KEY")
+        del values["VOLCENGINE_CODING_API_KEY"]
+        assert _resolve_ark_credential({}) == ("generic-key", "ARK_API_KEY")
+        del values["ARK_API_KEY"]
+        assert _resolve_ark_credential({}) == ("", "")
+
+
 def test_get_ark_api_key_from_env():
     orig = os.environ.get("VOLCENGINE_ARK_API_KEY")
     try:
@@ -80,6 +99,72 @@ def test_get_ark_api_key_from_env():
             os.environ.pop("VOLCENGINE_ARK_API_KEY", None)
         else:
             os.environ["VOLCENGINE_ARK_API_KEY"] = orig
+
+
+def _postprocess_request(raw, cfg, source, key="fake-key"):
+    captured = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        captured["payload"] = json.loads(req.data.decode("utf-8"))
+        return _FakeResponse({
+            "choices": [
+                {"finish_reason": "stop", "message": {"content": raw}},
+            ]
+        })
+
+    with patch.object(stt.urllib.request, "urlopen", fake_urlopen):
+        assert _llm_postprocess(raw, cfg, key, ark_key_source=source) == raw
+    return captured
+
+
+def test_default_endpoint_and_model_follow_key_source():
+    raw = "你好"
+    coding = _postprocess_request(raw, {}, "VOLCENGINE_CODING_API_KEY")
+    assert coding["url"] == stt.CODING_ARK_ENDPOINT
+    assert coding["payload"]["model"] == stt.CODING_LLM_MODEL
+
+    for source in ("VOLCENGINE_ARK_API_KEY", "ARK_API_KEY", ""):
+        regular = _postprocess_request(raw, {}, source)
+        assert regular["url"] == stt.REGULAR_ARK_ENDPOINT, source
+        assert regular["payload"]["model"] == stt.REGULAR_LLM_MODEL, source
+
+
+def test_explicit_ark_endpoint_and_model_win():
+    raw = "你好"
+    cfg = {
+        "ark_endpoint": "https://example.test/custom/chat/completions",
+        "llm_model": "custom-model",
+    }
+    captured = _postprocess_request(raw, cfg, "VOLCENGINE_CODING_API_KEY")
+    assert captured["url"] == "https://example.test/custom/chat/completions"
+    assert captured["payload"]["model"] == "custom-model"
+
+
+def test_http_error_code_logged_without_key():
+    secret = "super-secret-ark-key"
+    warnings = []
+
+    def fake_warning(message, *args, **kwargs):
+        warnings.append(message % args if args else message)
+
+    for code in ("InvalidSubscription", "ModelNotOpen"):
+        body = io.BytesIO(json.dumps({
+            "error": {"code": code, "message": f"{code} from Ark"},
+        }).encode("utf-8"))
+        error = urllib.error.HTTPError(
+            "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
+            400, "Bad Request", {}, body,
+        )
+        warnings.clear()
+        with patch.object(stt.urllib.request, "urlopen", side_effect=error), \
+                patch.object(stt.logger, "warning", fake_warning):
+            assert _llm_postprocess("你好", {}, secret, ark_key_source="ARK_API_KEY") == "你好"
+        text = " ".join(warnings)
+        assert "HTTP 400" in text
+        assert code in text
+        assert secret not in text
+        assert "Authorization" not in text
 
 
 def test_default_prompt_integrity():
@@ -250,7 +335,7 @@ def test_opt_in_matrix():
     path = _audio_file()
     calls = []
 
-    def fake_postprocess(raw, cfg, key):
+    def fake_postprocess(raw, cfg, key, **kwargs):
         calls.append((raw, key))
         return "润色 100"
 
@@ -286,7 +371,7 @@ def test_ark_key_alone_never_enables_postprocess():
     path = _audio_file()
     calls = []
 
-    def fake_postprocess(raw, cfg, key):
+    def fake_postprocess(raw, cfg, key, **kwargs):
         calls.append(raw)
         return "changed"
 

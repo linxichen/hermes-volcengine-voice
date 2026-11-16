@@ -9,7 +9,12 @@ import logging
 import os
 import re
 import uuid
-from typing import Dict, Any
+from typing import Dict, Any, Optional
+
+try:  # package import (Hermes plugin loader)
+    from .runtime import get_secret
+except ImportError:  # top-level import (unit tests run from the repo root)
+    from runtime import get_secret
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +28,18 @@ VOICES: Dict[str, str] = {
     "zh_male_conversation":   "zh_male_M392_conversation_wvae_bigtts",   # 对话男声（保留1.0）
     "zh_male_ruya":           "zh_male_ruyayichen_uranus_bigtts",        # 儒雅逸辰 2.0
 }
+
+VOICE_DISPLAY: Dict[str, str] = {
+    "zh_female_conversation": "爽快思思 2.0（默认）",
+    "zh_female_gentle": "Vivi 2.0 温柔女声",
+    "zh_female_sweet": "甜美小源 2.0",
+    "zh_male_conversation": "对话男声（1.0）",
+    "zh_male_ruya": "儒雅逸辰 2.0",
+}
+
+# Per-call text cap kept from the old plugin wrapper; Hermes's dispatcher also
+# chunks to its own provider cap before calling synthesize().
+MAX_TEXT_LENGTH = 5000
 
 # Map speakers to their required resource ID
 # seed-tts-2.0: 2.0 voices (preferred). seed-tts-1.0: legacy 1.0 voices.
@@ -81,6 +98,8 @@ def _volcengine_tts(
     text: str,
     output_path: str,
     tts_config: Dict[str, Any] | None = None,
+    *,
+    voice: Optional[str] = None,
 ) -> str:
     """Generate speech via Volcengine V3 HTTP Chunked TTS.
 
@@ -88,12 +107,18 @@ def _volcengine_tts(
     """
     import requests
 
-    api_key = os.getenv("VOLCENGINE_VOICE_API_KEY", "")
+    api_key = get_secret("VOLCENGINE_VOICE_API_KEY")
     if not api_key:
         raise ValueError("VOLCENGINE_VOICE_API_KEY not set")
 
-    cfg = tts_config.get("volcengine", {}) if tts_config else {}
-    speaker_raw = cfg.get("speaker", DEFAULT_SPEAKER)
+    cfg = tts_config.get("volcengine", {}) if isinstance(tts_config, dict) else {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+    # ``voice`` comes from tts.voice; the plugin's own tts.volcengine.speaker
+    # remains the default so existing configs keep working unchanged.
+    speaker_raw = voice or cfg.get("speaker") or DEFAULT_SPEAKER
+    if not isinstance(speaker_raw, str) or not speaker_raw.strip():
+        speaker_raw = DEFAULT_SPEAKER
     # Resolve short name → voice_type (e.g. zh_female_conversation → zh_female_shuangkuaisisi_uranus_bigtts)
     speaker = VOICES.get(speaker_raw, speaker_raw)
     sample_rate = cfg.get("sample_rate", 24000)
